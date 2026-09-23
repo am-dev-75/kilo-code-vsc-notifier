@@ -1,0 +1,736 @@
+diff --git a/packages/kilo-vscode/src/extension.ts b/packages/kilo-vscode/src/extension.ts
+index 466504a..4249e1d 100644
+--- a/packages/kilo-vscode/src/extension.ts
++++ b/packages/kilo-vscode/src/extension.ts
+@@ -31,6 +31,7 @@ import { registerCommitMessageService } from "./services/commit-message"
+ import { registerCodeActions, registerTerminalActions, KiloCodeActionProvider } from "./services/code-actions"
+ import { registerToggleAutoApprove } from "./commands/toggle-auto-approve"
+ import { registerHeapSnapshot } from "./commands/heap-snapshot"
++import { TaskStateBridge, type KiloExtensionApi } from "./services/public-api/task-state"
+ import { RemoteStatusService } from "./services/RemoteStatusService"
+ import { markWorkspace } from "./util/spotlight"
+ import { createNotebookBridge } from "./services/notebook"
+@@ -56,7 +57,7 @@ const panelTitleHandler = (panel: vscode.WebviewPanel) => (title: string) => {
+ // keybindings, autocomplete, commit-message generation, and URI deep links all work immediately —
+ // without requiring the user to open a Kilo sidebar or panel first. The CLI backend is NOT spawned here;
+ // it starts lazily when a webview connects or when ensureBackendForAutocomplete() triggers it.
+-export async function activate(context: vscode.ExtensionContext) {
++export async function activate(context: vscode.ExtensionContext): Promise<KiloExtensionApi> {
+   console.log("Kilo Code extension is now active")
+   shuttingDown = false
+ 
+@@ -326,6 +327,14 @@ export async function activate(context: vscode.ExtensionContext) {
+   // Prewarm only after all global event consumers are ready.
+   ensureBackendForAutocomplete(connectionService)
+ 
++  // Versioned, read-only public API for companion extensions. Purely
++  // additive: it only observes the same connection events as the attention
++  // service and changes nothing until another extension subscribes.
++  const taskStateBridge = new TaskStateBridge(connectionService, {
++    approve: (event, directory) => autoApprove.approve(event, directory),
++  })
++  context.subscriptions.push(taskStateBridge)
++
+   provider.setAutoApproveController(autoApprove)
+   agentManagerHost.setAutoApproveController(autoApprove)
+ 
+@@ -761,6 +770,8 @@ export async function activate(context: vscode.ExtensionContext) {
+       connectionService.dispose()
+     },
+   })
++
++  return taskStateBridge.api
+ }
+ 
+ export async function deactivate() {
+diff --git a/packages/kilo-vscode/src/services/public-api/task-state.ts b/packages/kilo-vscode/src/services/public-api/task-state.ts
+new file mode 100644
+index 0000000..be50baa
+--- /dev/null
++++ b/packages/kilo-vscode/src/services/public-api/task-state.ts
+@@ -0,0 +1,363 @@
++import * as vscode from "vscode"
++import type { SSEPayload } from "../cli-backend/sdk-sse-adapter"
++import type { KiloConnectionService } from "../cli-backend/connection-service"
++
++type Sync = Extract<SSEPayload, { type: "sync" }>
++type Question = Extract<SSEPayload, { type: "question.asked" | "question.replied" | "question.rejected" }>
++type Permission = Extract<SSEPayload, { type: "permission.asked" | "permission.replied" }>
++type PermissionAsked = Extract<Permission, { type: "permission.asked" }>
++type Status = Extract<SSEPayload, { type: "session.status" }>
++type Close = Extract<SSEPayload, { type: "session.turn.close" }>
++type ErrorEvent = Extract<SSEPayload, { type: "session.error" }>
++
++/**
++ * Public, read-only task states exposed to other extensions.
++ *
++ * The mapping from internal session/turn events is intentional and explicit:
++ *   - session.status busy/retry/offline -> "running" (the task is in flight)
++ *   - session.turn.close reason "completed" (root turn) -> "done"
++ *   - session.error + session.turn.close, or close reason "error" -> "error"
++ *   - question.asked / permission.asked -> "needsInput"
++ *   - question/permission replied -> "running"
++ *   - session.turn.close reason "interrupted"/"superseded" -> "cancelled"
++ *   - session.status idle is ignored: turn close is the authoritative outcome
++ */
++export type KiloTaskState = "running" | "done" | "error" | "needsInput" | "cancelled"
++
++export interface KiloTaskStateChangeEvent {
++  /** The Kilo session the task runs in. */
++  taskId: string
++  state: KiloTaskState
++  previousState?: KiloTaskState
++  /** Session title, when known from session metadata. Never a transcript. */
++  title?: string
++  /** Short, structural summary (permission or question label, error name). */
++  message?: string
++  /** ISO-8601 timestamp of the transition. */
++  timestamp: string
++}
++
++/** Versioned, read-only API surface returned by this extension's `activate()`. */
++export interface KiloExtensionApi {
++  readonly apiVersion: 1
++  onDidChangeTaskState: vscode.Event<KiloTaskStateChangeEvent>
++  getCurrentTasks(): Promise<KiloTaskStateChangeEvent[]>
++}
++
++export interface TaskStateBridgeOptions {
++  /**
++   * Auto-approval hook for permission events. Returning `true` (or a promise
++   * resolving to `true`) suppresses the "needsInput" event, mirroring how the
++   * attention service decides whether a permission needs the user at all.
++   */
++  approve?: (event: PermissionAsked, directory?: string) => boolean | Promise<boolean>
++  /** Diagnostic sink; defaults to console.log. Receives no user content. */
++  log?: (message: string) => void
++  /** Injectable clock for tests. */
++  now?: () => Date
++  /** Injectable emitter for tests; defaults to a vscode.EventEmitter. */
++  emitter?: TaskStateEmitter
++}
++
++/** The subset of vscode.EventEmitter the bridge needs (injectable for tests). */
++export interface TaskStateEmitter {
++  event: vscode.Event<KiloTaskStateChangeEvent>
++  fire(data: KiloTaskStateChangeEvent): void
++  dispose(): void
++}
++
++/** Sessions older than this are evicted first (bounded bookkeeping). */
++const MAX_TRACKED_SESSIONS = 2000
++
++/**
++ * Bridges authoritative Kilo backend task-state transitions to a versioned
++ * public `vscode.Event`. Mirrors the semantics of the attention service
++ * (the internal consumer that decides when a task needs the user), but is
++ * purely additive: nothing changes unless another extension subscribes.
++ */
++export class TaskStateBridge implements vscode.Disposable {
++  private readonly emitter: TaskStateEmitter
++  private readonly states = new Map<string, KiloTaskState>()
++  private readonly latest = new Map<string, KiloTaskStateChangeEvent>()
++  private readonly titles = new Map<string, string>()
++  private readonly active = new Set<string>()
++  private readonly errored = new Set<string>()
++  private readonly failed = new Set<string>()
++  private readonly goals = new Set<string>()
++  private readonly pendingQuestions = new Map<string, Set<string>>()
++  private readonly pendingPermissions = new Map<string, Set<string>>()
++  private readonly unsubscribeEvent: () => void
++  private readonly unsubscribeState: () => void
++  private readonly opts: TaskStateBridgeOptions
++  private disposed = false
++
++  constructor(connection: Pick<KiloConnectionService, "onEvent" | "onStateChange">, opts: TaskStateBridgeOptions = {}) {
++    this.opts = opts
++    this.emitter = opts.emitter ?? new vscode.EventEmitter<KiloTaskStateChangeEvent>()
++    this.unsubscribeEvent = connection.onEvent((event, directory) => {
++      try {
++        this.handle(event, directory)
++      } catch (error) {
++        this.log(`task-state bridge handler failed: ${error instanceof Error ? error.name : "unknown error"}`)
++      }
++    })
++    this.unsubscribeState = connection.onStateChange((state) => {
++      if (state === "error" || state === "disconnected") this.reset()
++    })
++  }
++
++  onDidChangeTaskState: vscode.Event<KiloTaskStateChangeEvent> = (listener, thisArgs, disposables) =>
++    this.emitter.event(listener, thisArgs, disposables)
++
++  getCurrentTasks(): Promise<KiloTaskStateChangeEvent[]> {
++    return Promise.resolve([...this.latest.values()])
++  }
++
++  /** The frozen, read-only API object handed out through `activate()`. */
++  get api(): KiloExtensionApi {
++    return Object.freeze({
++      apiVersion: 1,
++      onDidChangeTaskState: this.onDidChangeTaskState,
++      getCurrentTasks: () => this.getCurrentTasks(),
++    })
++  }
++
++  dispose() {
++    this.disposed = true
++    this.unsubscribeEvent()
++    this.unsubscribeState()
++    this.emitter.dispose()
++    this.reset()
++  }
++
++  private handle(event: SSEPayload, directory?: string) {
++    if (this.disposed) return
++    switch (event.type) {
++      case "sync":
++        return this.sync(event)
++      case "question.asked":
++      case "question.replied":
++      case "question.rejected":
++        return this.question(event, directory)
++      case "permission.asked":
++      case "permission.replied":
++        return this.permission(event, directory)
++      case "session.deleted":
++        return this.forget(event.properties.sessionID)
++      case "session.status":
++        return this.status(event)
++      case "session.turn.close":
++        return this.close(event, directory)
++      case "session.error":
++        return this.error(event)
++    }
++  }
++
++  private sync(event: Sync) {
++    switch (event.name) {
++      case "session.created.1":
++      case "session.updated.1": {
++        const info = event.data.info
++        this.rememberTitle(event.data.sessionID, info.title)
++        const goal = info.metadata?.["kilo.goal"]
++        if (goal && typeof goal === "object" && "active" in goal && goal.active === true) {
++          this.goals.add(event.data.sessionID)
++        } else {
++          this.goals.delete(event.data.sessionID)
++        }
++        return
++      }
++      case "session.deleted.1":
++        return this.forget(event.data.sessionID)
++      default:
++        return
++    }
++  }
++
++  private question(event: Question, directory?: string) {
++    const sessionID = event.properties.sessionID
++    if (event.type === "question.asked") {
++      const pending = this.pending(sessionID, this.pendingQuestions)
++      if (pending.has(event.properties.id)) return
++      pending.add(event.properties.id)
++      const header = event.properties.questions[0]?.header
++      this.transition(sessionID, "needsInput", header ? `Kilo needs input: ${header}` : "Kilo needs input")
++      return
++    }
++    if (this.pending(sessionID, this.pendingQuestions).delete(event.properties.requestID)) {
++      this.resume(sessionID)
++    }
++  }
++
++  private permission(event: Permission, directory?: string) {
++    const sessionID = event.properties.sessionID
++    if (event.type !== "permission.asked") {
++      if (this.pending(sessionID, this.pendingPermissions).delete(event.properties.requestID)) {
++        this.resume(sessionID)
++      }
++      return
++    }
++    const pending = this.pending(sessionID, this.pendingPermissions)
++    if (pending.has(event.properties.id)) return
++    pending.add(event.properties.id)
++    const alert = () => {
++      if (!pending.has(event.properties.id)) return
++      this.transition(sessionID, "needsInput", `Kilo needs permission: ${event.properties.permission}`)
++    }
++    const approval = this.opts.approve?.(event, directory)
++    if (approval === true) return
++    if (approval === false || approval === undefined) return alert()
++    void approval.then((handled) => {
++      if (!handled) alert()
++    }, alert)
++  }
++
++  private status(event: Status) {
++    const sessionID = event.properties.sessionID
++    switch (event.properties.status.type) {
++      case "busy":
++      case "retry":
++      case "offline":
++        this.active.add(sessionID)
++        this.errored.delete(sessionID)
++        this.failed.delete(sessionID)
++        // A status replay must not lift a pending question or permission:
++        // replies are the authoritative signal that input was provided.
++        if (this.states.get(sessionID) !== "needsInput") {
++          this.transition(sessionID, "running")
++        }
++        return
++      case "idle":
++        // Turn close (not idle) is the authoritative task outcome.
++        return
++      default:
++        this.log(
++          `ignoring unknown session status type: ${String((event.properties.status as { type?: unknown }).type)}`,
++        )
++    }
++  }
++
++  private close(event: Close, directory?: string) {
++    const sessionID = event.properties.sessionID
++    if (!this.active.delete(sessionID)) return
++    const root = event.properties.parentID === undefined
++    const wasErrored = this.errored.delete(sessionID)
++    const wasFailed = this.failed.delete(sessionID)
++    if (wasErrored && wasFailed) {
++      // Mirror the attention service: a failure was already observed while
++      // the task ran; only the closing root turn proves it was not transient.
++      // Aborted turns (MessageAbortedError) fall through to the reason
++      // mapping below so an interrupted close surfaces as "cancelled".
++      if (root) this.transition(sessionID, "error")
++      return
++    }
++    if (!root) return // Child (subagent) session turns are steps, not user tasks.
++    switch (event.properties.reason) {
++      case "completed":
++        if (!this.goals.has(sessionID)) this.transition(sessionID, "done")
++        return
++      case "error":
++        this.transition(sessionID, "error")
++        return
++      case "interrupted":
++      case "superseded":
++        this.transition(sessionID, "cancelled")
++        return
++      default:
++        this.log(`ignoring unknown turn close reason: ${String((event.properties as { reason?: unknown }).reason)}`)
++    }
++  }
++
++  private error(event: ErrorEvent) {
++    const sessionID = event.properties.sessionID
++    if (!sessionID || !this.active.has(sessionID)) return
++    this.errored.add(sessionID)
++    // MessageAbortedError is a deliberate abort, not a task failure; the turn
++    // will close as interrupted. Everything else is held until the turn
++    // closes, so a retry that recovers never emits a false "error".
++    if (event.properties.error?.name === "MessageAbortedError") return
++    this.failed.add(sessionID)
++  }
++
++  private resume(sessionID: string) {
++    if (this.pending(sessionID, this.pendingQuestions).size > 0) return
++    if (this.pending(sessionID, this.pendingPermissions).size > 0) return
++    if (this.states.get(sessionID) === "needsInput") this.transition(sessionID, "running")
++  }
++
++  private transition(sessionID: string, state: KiloTaskState, message?: string) {
++    const previous = this.states.get(sessionID)
++    if (previous === state) return // A repeated state is not a transition.
++    this.states.set(sessionID, state)
++    this.evictOldSessions()
++    const title = this.titles.get(sessionID)
++    const change: KiloTaskStateChangeEvent = Object.freeze({
++      taskId: sessionID,
++      state,
++      ...(previous !== undefined ? { previousState: previous } : {}),
++      ...(title !== undefined ? { title } : {}),
++      ...(message !== undefined ? { message } : {}),
++      timestamp: (this.opts.now ?? (() => new Date()))().toISOString(),
++    })
++    this.latest.set(sessionID, change)
++    try {
++      this.emitter.fire(change)
++    } catch (error) {
++      // One consumer must never break the bridge or other consumers.
++      this.log(`task-state listener failed: ${error instanceof Error ? error.name : "unknown error"}`)
++    }
++  }
++
++  private pending(sessionID: string, map: Map<string, Set<string>>): Set<string> {
++    let set = map.get(sessionID)
++    if (!set) {
++      set = new Set()
++      map.set(sessionID, set)
++    }
++    return set
++  }
++
++  private rememberTitle(sessionID: string, title?: string) {
++    if (!title) return
++    this.titles.set(sessionID, title)
++    this.evictOldSessions()
++  }
++
++  private forget(sessionID: string) {
++    this.states.delete(sessionID)
++    this.latest.delete(sessionID)
++    this.titles.delete(sessionID)
++    this.active.delete(sessionID)
++    this.errored.delete(sessionID)
++    this.failed.delete(sessionID)
++    this.goals.delete(sessionID)
++    this.pendingQuestions.delete(sessionID)
++    this.pendingPermissions.delete(sessionID)
++  }
++
++  private evictOldSessions() {
++    if (this.states.size <= MAX_TRACKED_SESSIONS) return
++    for (const sessionID of this.states.keys()) {
++      if (this.states.size <= MAX_TRACKED_SESSIONS) break
++      if (this.active.has(sessionID)) continue // never evict in-flight tasks
++      this.forget(sessionID)
++    }
++  }
++
++  private reset() {
++    this.states.clear()
++    this.latest.clear()
++    this.titles.clear()
++    this.active.clear()
++    this.errored.clear()
++    this.failed.clear()
++    this.goals.clear()
++    this.pendingQuestions.clear()
++    this.pendingPermissions.clear()
++  }
++
++  private log(message: string) {
++    const sink = this.opts.log ?? ((line: string) => console.log(`[Kilo New] ${line}`))
++    sink(message)
++  }
++}
+diff --git a/packages/kilo-vscode/tests/unit/public-api-task-state.test.ts b/packages/kilo-vscode/tests/unit/public-api-task-state.test.ts
+new file mode 100644
+index 0000000..103c8e5
+--- /dev/null
++++ b/packages/kilo-vscode/tests/unit/public-api-task-state.test.ts
+@@ -0,0 +1,316 @@
++import { describe, expect, it } from "bun:test"
++import type { SSEPayload } from "../../src/services/cli-backend/sdk-sse-adapter"
++import {
++  TaskStateBridge,
++  type KiloTaskStateChangeEvent,
++  type TaskStateEmitter,
++} from "../../src/services/public-api/task-state"
++
++/** Minimal functional emitter so tests observe real emissions. */
++class RecordingEmitter implements TaskStateEmitter {
++  readonly listeners = new Set<(data: KiloTaskStateChangeEvent) => void>()
++  readonly events: KiloTaskStateChangeEvent[] = []
++  disposed = false
++  event = (listener: (data: KiloTaskStateChangeEvent) => void) => {
++    this.listeners.add(listener)
++    return { dispose: () => this.listeners.delete(listener) }
++  }
++  fire = (data: KiloTaskStateChangeEvent) => {
++    this.events.push(data)
++    for (const listener of this.listeners) listener(data)
++  }
++  dispose = () => {
++    this.disposed = true
++    this.listeners.clear()
++  }
++}
++
++type Handler = (event: SSEPayload, directory?: string) => void
++
++function fixture(opts?: { logs?: string[]; approve?: () => boolean | Promise<boolean> }) {
++  const handlers: Handler[] = []
++  const stateHandlers: ((state: string) => void)[] = []
++  const emitter = new RecordingEmitter()
++  const logs: string[] = opts?.logs ?? []
++  const bridge = new TaskStateBridge(
++    {
++      onEvent: (listener: Handler) => {
++        handlers.push(listener)
++        return () => {}
++      },
++      onStateChange: (listener: (state: string) => void) => {
++        stateHandlers.push(listener)
++        return () => {}
++      },
++    },
++    { emitter, log: (line) => logs.push(line), approve: opts?.approve },
++  )
++  const received: KiloTaskStateChangeEvent[] = []
++  bridge.onDidChangeTaskState((change) => received.push(change))
++  const emit = (event: object) => {
++    for (const handler of handlers) handler(event as SSEPayload)
++  }
++  const states = () => received.map((change) => [change.previousState, change.state] as const)
++  return { bridge, emitter, received, emit, states, logs, stateHandlers }
++}
++
++const busy = (sid: string) => ({
++  type: "session.status",
++  id: "e",
++  properties: { sessionID: sid, status: { type: "busy" } },
++})
++const close = (sid: string, reason: string, parentID?: string) => ({
++  type: "session.turn.close",
++  id: "e",
++  properties: { sessionID: sid, reason, ...(parentID !== undefined ? { parentID } : {}) },
++})
++const sessionError = (sid: string, name: string) => ({
++  type: "session.error",
++  id: "e",
++  properties: { sessionID: sid, error: { name, data: { message: "boom" } } },
++})
++const question = (sid: string, id: string) => ({
++  type: "question.asked",
++  id: "e",
++  properties: { id, sessionID: sid, questions: [{ question: "Continue?", header: "Confirm", options: [] }] },
++})
++const questionReplied = (sid: string, requestID: string) => ({
++  type: "question.replied",
++  id: "e",
++  properties: { sessionID: sid, requestID, answers: [] },
++})
++const permission = (sid: string, id: string) => ({
++  type: "permission.asked",
++  id: "e",
++  properties: { id, sessionID: sid, permission: "bash", patterns: [], always: [], metadata: {} },
++})
++const permissionReplied = (sid: string, requestID: string) => ({
++  type: "permission.replied",
++  id: "e",
++  properties: { sessionID: sid, requestID, reply: "once" },
++})
++const sessionUpdated = (sid: string, title?: string, goalActive?: boolean) => ({
++  type: "sync",
++  name: "session.updated.1",
++  id: "e",
++  seq: 1,
++  aggregateID: sid,
++  data: {
++    sessionID: sid,
++    info: {
++      id: sid,
++      title,
++      metadata: goalActive === undefined ? undefined : { "kilo.goal": { text: "g", active: goalActive } },
++    },
++  },
++})
++
++describe("TaskStateBridge event mapping", () => {
++  it("maps busy status to running with previousState", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    expect(f.states()).toEqual([[undefined, "running"]])
++  })
++
++  it("maps successful completion to done", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(close("s1", "completed"))
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "done"],
++    ])
++  })
++
++  it("maps failure to error when a failing turn closes", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(sessionError("s1", "ApiError"))
++    f.emit(close("s1", "completed"))
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "error"],
++    ])
++  })
++
++  it("maps close reason error without a prior session.error", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(close("s1", "error"))
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "error"],
++    ])
++  })
++
++  it("maps interruption and supersession to cancelled", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(close("s1", "interrupted"))
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "cancelled"],
++    ])
++    f.emit(busy("s1"))
++    f.emit(close("s1", "superseded"))
++    expect(f.states()[3]).toEqual(["running", "cancelled"])
++  })
++
++  it("maps question and permission waiting to needsInput and replies back to running", async () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(question("s1", "q1"))
++    f.emit(question("s1", "q2")) // already needsInput: no duplicate transition
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "needsInput"],
++    ])
++    f.emit(questionReplied("s1", "q1"))
++    expect(f.states().length).toBe(2) // one question still pending
++    f.emit(questionReplied("s1", "q2"))
++    expect(f.states()[2]).toEqual(["needsInput", "running"])
++
++    f.emit(permission("s1", "p1"))
++    expect(f.states()[3]).toEqual(["running", "needsInput"])
++    f.emit(permissionReplied("s1", "p1"))
++    expect(f.states()[4]).toEqual(["needsInput", "running"])
++  })
++
++  it("suppresses needsInput for auto-approved permissions", async () => {
++    const f = fixture({ approve: () => true })
++    f.emit(busy("s1"))
++    f.emit(permission("s1", "p1"))
++    await new Promise((resolve) => setTimeout(resolve, 0))
++    expect(f.states()).toEqual([[undefined, "running"]])
++  })
++
++  it("does not lift needsInput on a busy status replay", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(question("s1", "q1"))
++    f.emit(busy("s1"))
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "needsInput"],
++    ])
++  })
++
++  it("ignores idle status and aborts are cancelled, not errors", () => {
++    const f = fixture()
++    f.emit({ type: "session.status", id: "e", properties: { sessionID: "s1", status: { type: "idle" } } })
++    f.emit(busy("s1"))
++    f.emit(sessionError("s1", "MessageAbortedError"))
++    f.emit(close("s1", "interrupted"))
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "cancelled"],
++    ])
++  })
++
++  it("skips child session completions and active goal sessions", () => {
++    const f = fixture()
++    f.emit(busy("child"))
++    f.emit(close("child", "completed", "root-session"))
++    // The child session started (running), but its completion is a step of the
++    // parent task, not a user-visible "done".
++    expect(f.states()).toEqual([[undefined, "running"]])
++
++    f.emit(sessionUpdated("goal", "A goal", true))
++    f.emit(busy("goal"))
++    f.emit(close("goal", "completed"))
++    // Both sessions reached running; neither produced a "done".
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      [undefined, "running"],
++    ])
++  })
++
++  it("carries the session title from sync events", () => {
++    const f = fixture()
++    f.emit(sessionUpdated("s1", "Refactor authentication"))
++    f.emit(busy("s1"))
++    f.emit(close("s1", "completed"))
++    expect(f.received[1].title).toBe("Refactor authentication")
++  })
++
++  it("handles unknown states safely without leaking content", () => {
++    const logs: string[] = []
++    const f = fixture({ logs })
++    f.emit({ type: "session.status", id: "e", properties: { sessionID: "s1", status: { type: "waiting" } } })
++    f.emit(busy("s1"))
++    f.emit(close("s1", "mystery"))
++    expect(f.states()).toEqual([[undefined, "running"]])
++    expect(logs.some((line) => line.includes("unknown session status type"))).toBe(true)
++    expect(logs.some((line) => line.includes("unknown turn close reason"))).toBe(true)
++  })
++
++  it("does not emit duplicate transitions for repeated identical states", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(busy("s1")) // replay
++    f.emit(close("s1", "completed"))
++    f.emit(close("s1", "completed")) // replay without a new busy
++    expect(f.states()).toEqual([
++      [undefined, "running"],
++      ["running", "done"],
++    ])
++  })
++
++  it("resets per-session state on connection loss", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit(close("s1", "completed"))
++    for (const handler of f.stateHandlers) handler("disconnected")
++    f.emit(busy("s1")) // fresh session start after reconnect
++    expect(f.states()[2]).toEqual([undefined, "running"])
++  })
++
++  it("cleans up on session deletion", () => {
++    const f = fixture()
++    f.emit(busy("s1"))
++    f.emit({ type: "session.deleted", id: "e", properties: { sessionID: "s1", info: {} } })
++    f.emit(close("s1", "completed")) // not active anymore
++    expect(f.states()).toEqual([[undefined, "running"]])
++  })
++})
++
++describe("TaskStateBridge public API", () => {
++  it("exposes a versioned, read-only api with frozen events", async () => {
++    const f = fixture()
++    const api = f.bridge.api
++    expect(api.apiVersion).toBe(1)
++    expect(typeof api.onDidChangeTaskState).toBe("function")
++    expect(Object.isFrozen(api)).toBe(true)
++
++    f.emit(busy("s1"))
++    f.emit(close("s1", "completed"))
++    const tasks = await api.getCurrentTasks()
++    expect(tasks.length).toBe(1)
++    expect(tasks[0].state).toBe("done")
++    expect(Object.isFrozen(tasks[0])).toBe(true)
++    expect(() => {
++      ;(tasks[0] as { state: string }).state = "running"
++    }).toThrow()
++  })
++
++  it("disposes subscriptions and the emitter, and survives a throwing listener", () => {
++    const f = fixture()
++    f.bridge.onDidChangeTaskState(() => {
++      throw new Error("bad listener")
++    })
++    f.emit(busy("s1"))
++    expect(f.emitter.events.length).toBe(1) // the throwing listener did not break the bridge
++    expect(f.received.length).toBe(1)
++
++    f.bridge.dispose()
++    expect(f.emitter.disposed).toBe(true)
++    f.emit(busy("s2")) // unsubscribed: no crash, no event
++    expect(f.emitter.events.length).toBe(1)
++  })
++
++  it("does not require any consumer for normal operation", () => {
++    const f = fixture()
++    f.emit(busy("s1")) // no listeners registered: no error, event still routed
++    expect(f.emitter.events.length).toBe(1)
++  })
++})

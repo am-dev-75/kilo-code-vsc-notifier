@@ -1,0 +1,100 @@
+{
+  "name": "kilo-telegram-notifier",
+  "displayName": "Kilo Telegram Notifier",
+  "description": "Sends Telegram notifications when a Kilo Code task completes, fails, or needs your input.",
+  "version": "0.1.0",
+  "publisher": "am-dev-75",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/am-dev-75/kilo-code-vsc-notifier"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "kiloTelegramNotifier.setBotToken",
+        "title": "Kilo Telegram: Set Bot Token"
+      },
+      {
+        "command": "kiloTelegramNotifier.sendTestNotification",
+        "title": "Kilo Telegram: Send Test Notification"
+      }
+    ],
+    "configuration": {
+      "title": "Kilo Telegram Notifier",
+      "properties": {
+        "kiloTelegramNotifier.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch for Telegram notifications."
+        },
+        "kiloTelegramNotifier.chatId": {
+          "type": "string",
+          "default": "",
+          "description": "Telegram chat ID that receives the notifications. Create a bot with @BotFather, start a chat with it, and use a chat ID lookup bot (for example @userinfobot) or the Telegram Bot API getUpdates method to obtain this value."
+        },
+        "kiloTelegramNotifier.notifyOnDone": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when a Kilo task completes successfully."
+        },
+        "kiloTelegramNotifier.notifyOnError": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when a Kilo task terminates with an error."
+        },
+        "kiloTelegramNotifier.notifyOnNeedsInput": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when a Kilo task needs input (a permission decision or an answer)."
+        },
+        "kiloTelegramNotifier.includeWorkspaceName": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include the workspace name in notification messages."
+        },
+        "kiloTelegramNotifier.minimumTransitionIntervalMs": {
+          "type": "number",
+          "default": 2000,
+          "description": "Minimum milliseconds between two notifications for the same task entering the same state (duplicate suppression window)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --production",
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.15.0",
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.32.0",
+    "esbuild": "^0.24.0",
+    "eslint": "^9.15.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.15.0",
+    "vitest": "^2.1.0"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "cheerio": "1.0.0"
+    }
+  }
+}
